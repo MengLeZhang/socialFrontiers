@@ -11,6 +11,8 @@
 #'@param non_frontiers Boolean value indicating if non-frontier borders are also
 #'returned. Default FALSE to speed up processing (see details).
 #'@param silent Boolean. To print progress or not. Default FALSE
+#'@param method character. Options for routines to extract borders. Note issues
+#' with method = 'rbindlist'
 #'
 #'@details
 #'This is strictly for 1) graphing purposes or 2) for spatial operations
@@ -20,26 +22,42 @@
 #'  1) Make an edge list of all bordering polygons with an indicator frontier
 #'  if they are a frontier (and include phi from the binomial inla)
 #'  2) From that edge list use st_intersect to extract ALL borders
-#'  Issue current method uses do.call(rbind) which is inefficient as number of
-#'  list items grows
-#' Original code: frontier creation source line 80+ onwards
+#'For step 2) we need a method to combine all the st_intersects from a list. By
+#'default rbindlist from data.table is fastest. However the bounding box may
+#'be incorrect. This is know to affect tmap's default map plotting behaviour but
+#'not a substantial issue. forLoop calls do.call(rbind) which is far slower
 #'
 #'@import dplyr
 #'@import sf
+#'@importFrom data.table rbindlist
 
 #'@export
 frontier_as_sf <-
   function(frontier_model,
            convert2Line = T,
            non_frontiers = F,
+           method = 'rbindlist', #method for controlling how we get the
            silent = F
            ) {
+
+
     ##  Check class
     data.class <- class(frontier_model)
 
     if (!('frontier_model' %in% data.class))
       stop ('Not a frontier_model object; please run frontier_detect()')
 
+    ## Check method for extracting borders is valid
+    validMethods <-
+      c('forLoop', 'preAllocate', 'rbindlist')
+
+    if(!(
+      method %in% validMethods
+    ))stop(
+      paste('Not a valid method for extracting borders. Choose one of:',
+            validMethods %>% paste(collapse = ', ')
+    )
+    )
 
     ##  An edge list of bordering polygons with an indicator frontier if that border
     ##  is a frontier or not
@@ -66,44 +84,90 @@ frontier_as_sf <-
       mutate(phi = frontier_model$phi[['Median']]) %>%
       select(id, phi)
 
-    ##  Now to run the st_intersection in a forloop
-    borders.sf <- list(NULL)
 
+# Methods and timing
     x <- proc.time()
+
+    borders_list <- list(NULL)
+
 
     for (i in 1:nrow(edgelist_borders)) {
       #i <- 1 # for testing
       zone1 <- edgelist_borders$col[i]
       zone2 <- edgelist_borders$row[i]
 
-      borders.sf[[i]] <-
-        data.for.borders[zone1, ] %>% st_intersection(data.for.borders[zone2, ]) # now we are intersecting polys to get borders
-      #borders.sf$frontier[i] <- edgelist_borders$frontier[i]
-
+      borders_list[[i]] <-
+        data.for.borders[zone1, ] %>%
+        sf::st_intersection(data.for.borders[zone2, ]) %>%
+        sf::st_cast('MULTILINESTRING')# now we are intersecting polys to get borders
       if (!silent & (i %% 10 == 0)) {
         print(i)
       }
 
     }
 
-    borders.sf <-
-      do.call(rbind, borders.sf)
     print(proc.time() - x)
 
+
+    y <- proc.time()
+
+    print(
+      method %>% paste('Using', . , collapse = ' ')
+    )
+
+
+    ##  method = forLoop
+    if(method == 'forLoop'){
+      borders_sf <-
+        do.call(rbind, borders_list)
+    }
+
+    ## method = preAllocate
+    if(method == 'preAllocate'){
+      n <- length(borders_list)
+
+      ## Create the data using the first and last item of the borders list
+      borders_sf <-
+        borders_list[[1]]
+      borders_sf[n, ] <-
+        borders_list[[n]]
+
+      for (j in 1:n){
+        borders_sf[j, ] <-
+          borders_list[[j]]
+      }
+
+    }
+
+    ## method = rbindlist from data.table
+    if(method == 'rbindlist'){
+      borders_sf <-
+        data.table::rbindlist(borders_list)
+
+      ##  we need to coerce back to sf
+      borders_sf <-
+        borders_sf %>%
+        st_as_sf()
+    }
+
+    print(proc.time() - y)
+
+
     ##  Add the frontier label
-    borders.sf$frontier <-
+    borders_sf$frontier <-
       edgelist_borders$frontier
+
 
 
     ##  Change to linefile if convert2Line is true
     if(convert2Line){
-      borders.sf <-
-        st_collection_extract(borders.sf, type = 'LINE') # lots more objects now but still has the frontier feature in the right place
+      borders_sf <-
+        st_collection_extract(borders_sf, type = 'LINE') # lots more objects now but still has the frontier feature in the right place
     }
 
 
     ##  add a class frontier_sf to the data
-    class(borders.sf) <- c('frontier_sf', class(borders.sf))
+    class(borders_sf) <- c('frontier_sf', class(borders_sf))
 
-    return(borders.sf)
+    return(borders_sf)
   }
